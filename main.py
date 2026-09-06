@@ -1,219 +1,352 @@
 # -*- coding: UTF-8 -*-
 
-import requests
-import json
-import time
-import random
 import os
-from requests.exceptions import RequestException
+import random
+import sys
+import time
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Callable, Optional
 
-TOKEN_LIST = os.getenv('TOKEN_LIST', '')
-SEND_KEY_LIST = os.getenv('SEND_KEY_LIST', '')
-
-# 接口配置
-url = 'https://m.jlc.com/api/activity/sign/signIn?source=3'
-gold_bean_url = "https://m.jlc.com/api/appPlatform/center/assets/selectPersonalAssetsInfo"
-seventh_day_url = "https://m.jlc.com/api/activity/sign/receiveVoucher"
+import requests
+from requests import Response, Session
+from requests.exceptions import RequestException
 
 
-# ======== 工具函数 ========
-
-def mask_account(account):
-    """用于打印时隐藏部分账号信息"""
-    if len(account) >= 4:
-        return account[:2] + '****' + account[-2:]
-    return '****'
-
-
-def mask_json_customer_code(data):
-    """递归地脱敏 JSON 中的 customerCode 字段"""
-    if isinstance(data, dict):
-        new_data = {}
-        for k, v in data.items():
-            if k == "customerCode" and isinstance(v, str):
-                new_data[k] = v[:1] + "xxxxx" + v[-2:]  # 例: 1xxxxx8A
-            else:
-                new_data[k] = mask_json_customer_code(v)
-        return new_data
-    elif isinstance(data, list):
-        return [mask_json_customer_code(i) for i in data]
-    else:
-        return data
-
-
-# ======== 推送通知 ========
-
-def send_msg_by_server(send_key, title, content):
-    push_url = f'https://sctapi.ftqq.com/{send_key}.send'
-    data = {
-        'text': title,
-        'desp': content
-    }
+if hasattr(sys.stdout, "reconfigure"):
     try:
-        response = requests.post(push_url, data=data)
-        return response.json()
-    except RequestException:
-        return None
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
 
 
-# ======== 单个账号签到逻辑 ========
+BASE_URL = "https://m.jlc.com"
+SECRET_KEY_URL = f"{BASE_URL}/api/integrated/secret/update"
+ASSETS_URL = f"{BASE_URL}/api/appPlatform/center/assets/selectPersonalAssetsInfo"
+SIGN_CONFIG_URL = f"{BASE_URL}/api/activity/sign/getCurrentUserSignInConfig"
+SIGN_IN_URL = f"{BASE_URL}/api/activity/sign/signIn"
+RECEIVE_VOUCHER_URL = f"{BASE_URL}/api/activity/sign/receiveVoucher"
 
-def sign_in(access_token):
-    headers = {
-        'X-JLC-AccessToken': access_token,
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2_1 like Mac OS X) '
-                      'AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Html5Plus/1.0 (Immersed/20) JlcMobileApp',
-    }
+REQUEST_TIMEOUT = (10, 20)
+SECRET_KEY_EXPIRED_CODES = {29001, 29003}
+
+
+class JLCError(Exception):
+    """嘉立创接口调用失败。"""
+
+
+class JLCAuthError(JLCError):
+    """AccessToken 已失效，或服务端拒绝了当前鉴权信息。"""
+
+
+@dataclass
+class AccountResult:
+    status: str
+    message: str
+    notification: Optional[str] = None
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "failed"
+
+
+def mask_value(value: str) -> str:
+    """隐藏凭证或客编，只保留首尾两个字符。"""
+    if len(value) >= 4:
+        return value[:2] + "****" + value[-2:]
+    return "****"
+
+
+def response_message(response: Response, payload: Optional[dict] = None) -> str:
+    if isinstance(payload, dict) and payload.get("message"):
+        return str(payload["message"])
+    text = (getattr(response, "text", "") or "").strip()
+    return text[:200] if text else "服务端未返回错误详情"
+
+
+class JLCClient:
+    """按嘉立创当前 Web 端协议调用签到接口。"""
+
+    def __init__(
+        self,
+        access_token: str,
+        session: Optional[Session] = None,
+        retries: int = 3,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.session = session or requests.Session()
+        self.retries = max(1, retries)
+        self.sleeper = sleeper
+        self.headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"{BASE_URL}/mapp/pages-common/integral/index",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "X-JLC-AccessToken": access_token,
+            "X-JLC-ClientType": "WEB",
+        }
+
+    def _send(self, method: str, url: str, **kwargs) -> Response:
+        last_error: Optional[RequestException] = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                return self.session.request(
+                    method,
+                    url,
+                    headers=dict(self.headers),
+                    timeout=REQUEST_TIMEOUT,
+                    **kwargs,
+                )
+            except RequestException as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    self.sleeper(2 * attempt)
+        raise JLCError(f"网络请求连续失败 {self.retries} 次：{last_error}")
+
+    @staticmethod
+    def _parse_json(response: Response) -> dict:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise JLCError(
+                f"接口返回了非 JSON 内容（HTTP {response.status_code}）"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise JLCError("接口返回的数据格式不是 JSON 对象")
+        return payload
+
+    def _check_response(self, response: Response) -> dict:
+        payload: Optional[dict] = None
+        try:
+            payload = self._parse_json(response)
+        except JLCError:
+            if response.status_code == 401:
+                raise JLCAuthError(
+                    "HTTP 401：AccessToken 已失效，或鉴权协议已变化"
+                )
+            raise
+
+        if response.status_code == 401 or payload.get("code") == 401:
+            raise JLCAuthError(f"HTTP 401：{response_message(response, payload)}")
+
+        try:
+            response.raise_for_status()
+        except RequestException as exc:
+            raise JLCError(
+                f"HTTP {response.status_code}：{response_message(response, payload)}"
+            ) from exc
+        return payload
+
+    def refresh_secret_key(self) -> str:
+        response = self._send("POST", SECRET_KEY_URL)
+        payload = self._check_response(response)
+        key_id = (payload.get("data") or {}).get("keyId")
+        if payload.get("code") != 200 or not key_id:
+            raise JLCError(
+                f"获取动态 secretkey 失败：{response_message(response, payload)}"
+            )
+        self.headers["secretkey"] = str(key_id)
+        return str(key_id)
+
+    def request_json(self, method: str, url: str, **kwargs) -> dict:
+        if "secretkey" not in self.headers:
+            self.refresh_secret_key()
+
+        response = self._send(method, url, **kwargs)
+        payload = self._check_response(response)
+
+        if payload.get("code") in SECRET_KEY_EXPIRED_CODES:
+            self.refresh_secret_key()
+            response = self._send(method, url, **kwargs)
+            payload = self._check_response(response)
+
+        return payload
+
+
+def require_success(payload: dict, operation: str) -> dict:
+    if not payload.get("success"):
+        message = payload.get("message") or "未知错误"
+        raise JLCError(f"{operation}失败：{message}")
+    data = payload.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def fetch_assets(client: JLCClient) -> tuple[str, int]:
+    data = require_success(client.request_json("GET", ASSETS_URL), "查询金豆")
+    customer_code = str(data.get("customerCode") or "未知账号")
+    try:
+        integral_voucher = int(data.get("integralVoucher") or 0)
+    except (TypeError, ValueError) as exc:
+        raise JLCError("查询金豆失败：integralVoucher 格式异常") from exc
+    return customer_code, integral_voucher
+
+
+def sign_in(access_token: str, session: Optional[Session] = None) -> AccountResult:
+    credential_label = mask_value(access_token)
+    client = JLCClient(access_token, session=session)
 
     try:
-        # 1. 获取金豆信息（先获取，用于获取 customer_code）
-        bean_response = requests.get(gold_bean_url, headers=headers)
-        bean_response.raise_for_status()
-        bean_result = bean_response.json()
+        customer_code, before_balance = fetch_assets(client)
+        account_label = mask_value(customer_code)
 
-        # 获取 customerCode
-        customer_code = bean_result['data']['customerCode']
-        integral_voucher = bean_result['data']['integralVoucher']
+        config = require_success(
+            client.request_json("GET", SIGN_CONFIG_URL), "查询签到状态"
+        )
+        if config.get("haveSignIn"):
+            message = f"ℹ️ [账号{account_label}] 今日已签到"
+            print(message)
+            return AccountResult("already", message)
 
-        # 2. 执行签到请求
-        sign_response = requests.get(url, headers=headers)
-        sign_response.raise_for_status()
-        sign_result = sign_response.json()
+        sign_data = require_success(
+            client.request_json(
+                "GET",
+                SIGN_IN_URL,
+                params={"platformType": "WEB", "source": 4},
+            ),
+            "签到",
+        )
+        status = sign_data.get("status")
+        gain_num = sign_data.get("gainNum")
 
-        # 打印签到响应 JSON（已脱敏）
-        # print(f"🔍 [账号{mask_account(customer_code)}] 签到响应JSON:")
-        # print(json.dumps(mask_json_customer_code(sign_result), indent=2, ensure_ascii=False))
+        if status == 2:
+            message = f"ℹ️ [账号{account_label}] 今日已签到"
+            print(message)
+            return AccountResult("already", message)
+        if status != 1:
+            raise JLCError(f"签到失败：接口返回状态 {status!r}")
 
-        # 检查签到是否成功
-        if not sign_result.get('success'):
-            message = sign_result.get('message', '未知错误')
-            if '已经签到' in message:
-                print(f"ℹ️ [账号{mask_account(customer_code)}] 今日已签到")
-                return None  # 今日已签到，不返回消息
-            else:
-                print(f"❌ [账号{mask_account(customer_code)}] 签到失败 - {message}")
-                return None  # 签到失败，不返回消息
+        if gain_num in (None, 0):
+            require_success(
+                client.request_json("GET", RECEIVE_VOUCHER_URL), "领取签到奖励"
+            )
 
-        # 解析签到数据
-        data = sign_result.get('data', {})
-        
-        # 安全地获取 gainNum 和 status
-        gain_num = data.get('gainNum') if data else None
-        status = data.get('status') if data else None
-
-        # 处理签到结果
-        if status and status > 0:
-            if gain_num is not None and gain_num != 0:
-                print(f"✅ [账号{mask_account(customer_code)}] 今日签到成功")
-                return f"✅ 账号({mask_account(customer_code)})：获取{gain_num}个金豆，当前总数：{integral_voucher + gain_num}"
-            else:
-                # 第七天特殊处理
-                seventh_response = requests.get(seventh_day_url, headers=headers)
-                seventh_response.raise_for_status()
-                seventh_result = seventh_response.json()
-
-                if seventh_result.get("success"):
-                    print(f"🎉 [账号{mask_account(customer_code)}] 第七天签到成功")
-                    return f"🎉 账号({mask_account(customer_code)})：第七天签到成功，当前金豆总数：{integral_voucher + 8}"
-                else:
-                    print(f"ℹ️ [账号{mask_account(customer_code)}] 第七天签到失败，无金豆获取")
-                    return None
+        _, after_balance = fetch_assets(client)
+        actual_gain = after_balance - before_balance
+        if actual_gain > 0:
+            notification = (
+                f"✅ 账号({account_label})：获取{actual_gain}个金豆，"
+                f"当前总数：{after_balance}"
+            )
         else:
-            print(f"ℹ️ [账号{mask_account(customer_code)}] 今日已签到或签到失败")
-            return None
+            notification = (
+                f"✅ 账号({account_label})：签到成功，当前金豆总数：{after_balance}"
+            )
+        print(f"✅ [账号{account_label}] 今日签到成功")
+        return AccountResult("success", "签到成功", notification)
 
-    except RequestException as e:
-        print(f"❌ [账号{mask_account(access_token)}] 网络请求失败: {str(e)}")
-        return None
-    except KeyError as e:
-        print(f"❌ [账号{mask_account(access_token)}] 数据解析失败: 缺少键 {str(e)}")
-        return None
-    except Exception as e:
-        print(f"❌ [账号{mask_account(access_token)}] 未知错误: {str(e)}")
-        return None
+    except JLCAuthError as exc:
+        message = (
+            f"❌ [凭证{credential_label}] 鉴权失败：{exc}。"
+            "请重新登录嘉立创并更新 TOKEN_LIST"
+        )
+    except JLCError as exc:
+        message = f"❌ [凭证{credential_label}] 请求失败：{exc}"
+    except Exception as exc:  # 防止单个账号中断其他账号，但仍让任务最终失败
+        message = f"❌ [凭证{credential_label}] 未知错误：{exc}"
+
+    print(message)
+    return AccountResult("failed", message, message)
 
 
-# ======== 主函数 ========
+def send_msg_by_server(send_key: str, title: str, content: str) -> bool:
+    push_url = f"https://sctapi.ftqq.com/{send_key}.send"
+    try:
+        response = requests.post(
+            push_url,
+            data={"title": title, "desp": content},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result.get("code") == 0
+    except (RequestException, TypeError, ValueError) as exc:
+        print(f"❌ Server酱通知失败：{exc}")
+        return False
 
-def main():
-    # 从 GitHub Secrets 获取配置
-    AccessTokenList = [token.strip() for token in TOKEN_LIST.split(',') if token.strip()]
-    SendKeyList = [key.strip() for key in SEND_KEY_LIST.split(',') if key.strip()]
 
-    # 检查配置是否为空
-    if not AccessTokenList:
-        print("❌ 请设置 TOKENS")
-        return
-        
-    if not SendKeyList:
-        print("❌ 请设置 SENDKEYS")
-        return
+def main(
+    token_list: Optional[str] = None,
+    send_key_list: Optional[str] = None,
+    sign_func: Callable[[str], AccountResult] = sign_in,
+    send_func: Callable[[str, str, str], bool] = send_msg_by_server,
+    sleep_func: Callable[[float], None] = time.sleep,
+    randint_func: Callable[[int, int], int] = random.randint,
+) -> int:
+    tokens_value = os.getenv("TOKEN_LIST", "") if token_list is None else token_list
+    keys_value = (
+        os.getenv("SEND_KEY_LIST", "") if send_key_list is None else send_key_list
+    )
+    tokens = [token.strip() for token in tokens_value.split(",") if token.strip()]
+    send_keys = [key.strip() for key in keys_value.split(",") if key.strip()]
 
-    # 确保长度一致
-    min_length = min(len(AccessTokenList), len(SendKeyList))
-    AccessTokenList = AccessTokenList[:min_length]
-    SendKeyList = SendKeyList[:min_length]
+    if not tokens:
+        print("❌ 请设置 TOKEN_LIST")
+        return 2
+    if not send_keys:
+        print("❌ 请设置 SEND_KEY_LIST")
+        return 2
+    if len(tokens) != len(send_keys):
+        print(
+            "❌ TOKEN_LIST 与 SEND_KEY_LIST 数量不一致："
+            f"{len(tokens)} 个 Token，{len(send_keys)} 个 SendKey"
+        )
+        return 2
 
-    print(f"🔧 共发现 {min_length} 个账号需要签到")
-
-    # 按 SendKey 分组
+    print(f"🔧 共发现 {len(tokens)} 个账号需要签到")
     task_groups = defaultdict(list)
-    for access_token, send_key in zip(AccessTokenList, SendKeyList):
+    for access_token, send_key in zip(tokens, send_keys):
         task_groups[send_key].append(access_token)
-
     print(f"📊 共分为 {len(task_groups)} 个通知组")
 
-    # 顺序执行签到任务
-    group_results = {}
+    all_results = []
+    notification_failed = False
 
-    for send_key, tokens in task_groups.items():
-        print(f"\n🚀 开始处理 SendKey: {send_key[:5]}... 的 {len(tokens)} 个账号")
-        results = []
-        
-        for i, token in enumerate(tokens):
-            print(f"📝 处理第 {i+1}/{len(tokens)} 个账号...")
-            
-            # 执行签到
-            result = sign_in(token)
-            if result is not None:
-                results.append(result)
-            
-            # 如果不是最后一个账号，则等待随机时间
-            if i < len(tokens) - 1:
-                wait_time = random.randint(5, 15)
+    for send_key, group_tokens in task_groups.items():
+        print(f"\n🚀 开始处理 SendKey: {send_key[:5]}... 的 {len(group_tokens)} 个账号")
+        group_results = []
+
+        for index, token in enumerate(group_tokens, 1):
+            print(f"📝 处理第 {index}/{len(group_tokens)} 个账号...")
+            result = sign_func(token)
+            group_results.append(result)
+            all_results.append(result)
+
+            if index < len(group_tokens):
+                wait_time = randint_func(5, 15)
                 print(f"⏳ 等待 {wait_time} 秒后处理下一个账号...")
-                time.sleep(wait_time)
-        
-        group_results[send_key] = results
+                sleep_func(wait_time)
 
-    # 推送通知 - 只在有获取到金豆时才发送
-    print("\n📬 开始检查是否需要发送通知...")
-    notification_sent = False
-    
-    for send_key, results in group_results.items():
-        if results:
-            content = "\n\n".join(results)
-            print(f"📤 检测到有金豆获取，准备发送通知给 SendKey: {send_key[:5]}...")
-            
-            response = send_msg_by_server(send_key, "嘉立创签到汇总", content)
-            
-            if response and response.get('code') == 0:
-                print(f"✅ 通知发送成功！消息ID: {response.get('data', {}).get('pushid', '')}")
-                notification_sent = True
+        notices = [item.notification for item in group_results if item.notification]
+        if notices:
+            title = (
+                "嘉立创签到异常"
+                if all(item.failed for item in group_results)
+                else "嘉立创签到汇总"
+            )
+            if send_func(send_key, title, "\n\n".join(notices)):
+                print(f"✅ 通知发送成功：SendKey {send_key[:5]}...")
             else:
-                error_msg = response.get('message') if response else '未知错误'
-                print(f"❌ 通知发送失败！错误: {error_msg}")
+                notification_failed = True
         else:
-            print(f"⏭️ SendKey: {send_key[:5]}... 组内无金豆获取，跳过通知")
-    
-    if not notification_sent:
-        print("ℹ️ 所有账号均未获取到金豆，无通知发送")
+            print(f"⏭️ SendKey: {send_key[:5]}... 无新增金豆或异常，跳过通知")
+
+    failure_count = sum(result.failed for result in all_results)
+    if failure_count:
+        print(f"❌ 共 {failure_count}/{len(all_results)} 个账号处理失败")
+        return 1
+    if notification_failed:
+        print("❌ 签到完成，但至少一组通知发送失败")
+        return 1
+
+    print("✅ 所有账号处理完成")
+    return 0
 
 
-# ======== 程序入口 ========
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     print("🏁 嘉立创自动签到任务开始")
-    main()
+    exit_code = main()
     print("🏁 任务执行完毕")
+    raise SystemExit(exit_code)

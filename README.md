@@ -25,6 +25,8 @@
 5. 多个账号用英文逗号 `,` 分隔
 6. 建议使用手机抓包，请勿手动退出账号，否则会导致token失效
 
+脚本会按当前 Web 端协议自动获取动态 `secretkey`，无需把 `secretkey` 保存到 GitHub Secrets。
+
 ### 2️⃣ 获取 SendKey（Server 酱）
 
 1. 打开 [Server 酱官网](https://sct.ftqq.com/)
@@ -57,9 +59,16 @@ SEND_KEY_LIST这样填：your_key1,your_key2
 
 ## 📋 执行流程
 
-1. 自动签到获取金豆
-2. 检查是否为第七天签到
-3. 查询当前金豆余额并推送
+1. 获取动态 `secretkey` 并验证 AccessToken
+2. 查询签到状态，未签到时按 Web 端参数执行签到
+3. 查询签到前后金豆余额并推送实际变化
+4. 任一账号失败时发送异常通知，并让 GitHub Actions 返回失败状态
+
+### 常见问题
+
+如果日志提示 `HTTP 401` 或“用户未登录或会话失效”，请重新登录嘉立创，重新抓取
+`X-JLC-AccessToken`，再更新仓库的 `TOKEN_LIST` Secret。不要把 AccessToken 写进代码、
+Issue 或公开日志。
 
 ---
 
